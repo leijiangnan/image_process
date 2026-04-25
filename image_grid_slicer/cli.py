@@ -11,7 +11,8 @@ from PIL import Image
 
 NEAR_WHITE_RGB = (244, 244, 244)
 BACKGROUND_DISTANCE = 28
-OUTPUT_PADDING = 6
+OUTPUT_PADDING = 12
+SOURCE_MARGIN_RATIO = 0.22
 GIF_ROTATION_DEGREES = (-2.0, 2.0)
 GIF_FRAME_DURATION_MS = 180
 
@@ -72,6 +73,58 @@ def iter_boxes(
             index += 1
 
 
+def detect_black_grid_boxes(
+    image: Image.Image,
+    cols: int,
+    rows: int,
+) -> list[tuple[int, int, int, int, int, int, int]] | None:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+
+    def is_dark(pixel: tuple[int, int, int]) -> bool:
+        return max(pixel) <= 45
+
+    def runs(values: list[bool]) -> list[tuple[int, int]]:
+        found: list[tuple[int, int]] = []
+        start: int | None = None
+        for index, value in enumerate(values + [False]):
+            if value and start is None:
+                start = index
+            elif not value and start is not None:
+                if index - start >= 2:
+                    found.append((start, index))
+                start = None
+        return found
+
+    dark_columns = [
+        sum(1 for y in range(height) if is_dark(pixels[x, y])) >= height * 0.72
+        for x in range(width)
+    ]
+    dark_rows = [
+        sum(1 for x in range(width) if is_dark(pixels[x, y])) >= width * 0.72
+        for y in range(height)
+    ]
+    column_runs = runs(dark_columns)
+    row_runs = runs(dark_rows)
+    if len(column_runs) != cols + 1 or len(row_runs) != rows + 1:
+        return None
+
+    boxes: list[tuple[int, int, int, int, int, int, int]] = []
+    index = 1
+    for row in range(rows):
+        for col in range(cols):
+            left = column_runs[col][1] + 1
+            top = row_runs[row][1] + 1
+            right = column_runs[col + 1][0] - 1
+            bottom = row_runs[row + 1][0] - 1
+            if left >= right or top >= bottom:
+                return None
+            boxes.append((index, row + 1, col + 1, left, top, right, bottom))
+            index += 1
+    return boxes
+
+
 def expand_to_square(
     left: int,
     top: int,
@@ -111,13 +164,35 @@ def make_square_slice(
         crop = image.crop((crop_left, crop_top, crop_right, crop_bottom))
         square.paste(crop, (crop_left - square_left, crop_top - square_top))
 
-    inner_box = (
+    keep_box = (
         left - square_left,
         top - square_top,
         right - square_left,
         bottom - square_top,
     )
-    return keep_components_intersecting_box(square, inner_box, side)
+    return keep_content_regions(square, keep_box)
+
+
+def make_plain_square_slice(image: Image.Image, cell_box: tuple[int, int, int, int]) -> Image.Image:
+    left, top, right, bottom = cell_box
+    width = right - left
+    height = bottom - top
+    side = max(width, height)
+    background = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
+    output = Image.new(image.mode, (side, side), background)
+    crop = image.crop((left, top, right, bottom))
+    output.paste(crop, ((side - width) // 2, (side - height) // 2))
+    return output
+
+
+def expand_box(
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    margin: int,
+) -> tuple[int, int, int, int]:
+    return left - margin, top - margin, right + margin, bottom + margin
 
 
 def is_near_white(pixel: tuple[int, ...]) -> bool:
@@ -149,22 +224,24 @@ def is_background(pixel: tuple[int, ...], background: tuple[int, int, int]) -> b
     return distance <= BACKGROUND_DISTANCE and min(pixel[:3]) >= 215
 
 
-def keep_components_intersecting_box(
-    image: Image.Image,
-    keep_box: tuple[int, int, int, int],
-    side: int,
-) -> Image.Image:
+def keep_content_regions(image: Image.Image, keep_box: tuple[int, int, int, int]) -> Image.Image:
     rgb = image.convert("RGB")
     width, height = rgb.size
     pixels = rgb.load()
-    background = estimate_background_color(image)
-    mask = [[not is_background(pixels[x, y], background) for x in range(width)] for y in range(height)]
+    background_color = estimate_background_color(image)
+    mask = [[not is_background(pixels[x, y], background_color) for x in range(width)] for y in range(height)]
     visited: set[tuple[int, int]] = set()
-    background = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
-    output = Image.new(image.mode, (side, side), background)
-    source_pixels = image.load()
-    output_pixels = output.load()
+    white = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
+    output = Image.new(image.mode, image.size, white)
     keep_left, keep_top, keep_right, keep_bottom = keep_box
+    copy_boxes: list[tuple[int, int, int, int]] = [
+        (
+            max(0, keep_left),
+            max(0, keep_top),
+            min(width, keep_right),
+            min(height, keep_bottom),
+        )
+    ]
 
     for y in range(height):
         for x in range(width):
@@ -193,165 +270,144 @@ def keep_components_intersecting_box(
                 for px, py in component
                 if keep_left <= px < keep_right and keep_top <= py < keep_bottom
             )
+            if inside_count < 8:
+                continue
+
             xs = [point[0] for point in component]
             ys = [point[1] for point in component]
             component_left = min(xs)
-            component_right = max(xs)
+            component_right = max(xs) + 1
             component_top = min(ys)
-            component_bottom = max(ys)
+            component_bottom = max(ys) + 1
+            outside_cell = (
+                component_left < keep_left
+                or component_top < keep_top
+                or component_right > keep_right
+                or component_bottom > keep_bottom
+            )
+            component_width = component_right - component_left
+            component_height = component_bottom - component_top
             center_x = (component_left + component_right) / 2
             center_y = (component_top + component_bottom) / 2
             center_in_cell = keep_left <= center_x < keep_right and keep_top <= center_y < keep_bottom
             inside_ratio = inside_count / len(component)
-            component_width = component_right - component_left + 1
-            component_height = component_bottom - component_top + 1
-            inset_x = max(12, round((keep_right - keep_left) * 0.08))
-            inset_y = max(12, round((keep_bottom - keep_top) * 0.08))
-            safe_left = keep_left + inset_x
-            safe_top = keep_top + inset_y
-            safe_right = keep_right - inset_x
-            safe_bottom = keep_bottom - inset_y
-            safe_inside_count = sum(
-                1
-                for px, py in component
-                if safe_left <= px < safe_right and safe_top <= py < safe_bottom
-            )
-            average_brightness = sum(
-                pixels[px, py][0] + pixels[px, py][1] + pixels[px, py][2]
-                for px, py in component
-            ) / (3 * len(component))
-            touches_canvas_edge = (
-                component_left == 0
-                or component_top == 0
-                or component_right == width - 1
-                or component_bottom == height - 1
-            )
-            near_cell_edge = (
-                abs(component_left - keep_left) <= 3
-                or abs(component_right - (keep_right - 1)) <= 3
-                or abs(component_top - keep_top) <= 3
-                or abs(component_bottom - (keep_bottom - 1)) <= 3
-            )
-            thin_boundary_artifact = (
-                near_cell_edge
-                and safe_inside_count == 0
-                and (
-                    component_width <= width * 0.08
-                    or component_height <= height * 0.055
+
+            if not (center_in_cell or inside_ratio >= 0.5):
+                continue
+            if outside_cell and len(component) < 180 and min(component_width, component_height) < 12:
+                continue
+
+            padding = 10
+            copy_boxes.append(
+                (
+                    max(0, component_left - padding),
+                    max(0, component_top - padding),
+                    min(width, component_right + padding),
+                    min(height, component_bottom + padding),
                 )
             )
-            light_line_artifact = (
-                safe_inside_count == 0
-                and average_brightness >= 225
-                and component_height <= max(5, round(height * 0.018))
-                and component_width >= width * 0.18
+
+    for box in copy_boxes:
+        if box[0] >= box[2] or box[1] >= box[3]:
+            continue
+        output.paste(image.crop(box), box[:2])
+    output = remove_right_edge_intrusions(output, keep_box)
+
+    if not copy_boxes:
+        return output
+
+    left = min(box[0] for box in copy_boxes)
+    top = min(box[1] for box in copy_boxes)
+    right = max(box[2] for box in copy_boxes)
+    bottom = max(box[3] for box in copy_boxes)
+    return center_crop_to_content(output, (left, top, right, bottom))
+
+
+def remove_right_edge_intrusions(image: Image.Image, keep_box: tuple[int, int, int, int]) -> Image.Image:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+    background_color = estimate_background_color(image)
+    mask = [[not is_background(pixels[x, y], background_color) for x in range(width)] for y in range(height)]
+    visited: set[tuple[int, int]] = set()
+    output = image.copy()
+    output_pixels = output.load()
+    white = (255, 255, 255, 255) if "A" in output.getbands() else (255, 255, 255)
+    keep_left, keep_top, keep_right, keep_bottom = keep_box
+    edge_band = max(12, round((keep_right - keep_left) * 0.055))
+
+    for y in range(height):
+        for x in range(width):
+            if (x, y) in visited or not mask[y][x]:
+                continue
+
+            component: list[tuple[int, int]] = []
+            stack = [(x, y)]
+            visited.add((x, y))
+            while stack:
+                cx, cy = stack.pop()
+                component.append((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if (
+                        (nx, ny) in visited
+                        or not (0 <= nx < width and 0 <= ny < height)
+                        or not mask[ny][nx]
+                    ):
+                        continue
+                    visited.add((nx, ny))
+                    stack.append((nx, ny))
+
+            xs = [point[0] for point in component]
+            ys = [point[1] for point in component]
+            component_left = min(xs)
+            component_right = max(xs) + 1
+            component_top = min(ys)
+            component_bottom = max(ys) + 1
+            component_width = component_right - component_left
+            component_height = component_bottom - component_top
+            average_chroma = sum(
+                max(pixels[px, py]) - min(pixels[px, py])
+                for px, py in component
+            ) / len(component)
+            near_right_edge = component_right >= keep_right - edge_band
+            isolated_sliver = (
+                len(component) <= 650
+                and component_left >= keep_right - edge_band * 4
+                and (component_width <= edge_band * 2 or component_height <= edge_band * 4)
             )
-            light_outer_artifact = (
-                safe_inside_count == 0
-                and len(component) <= 120
-                and average_brightness >= 225
-            )
-            keep_component = inside_count >= 8 and (center_in_cell or inside_ratio >= 0.5)
-            if (
-                (touches_canvas_edge and safe_inside_count == 0 and inside_ratio < 0.85)
-                or thin_boundary_artifact
-                or light_line_artifact
-                or light_outer_artifact
-            ):
-                keep_component = False
-            if keep_component:
-                for px, py in component:
-                    output_pixels[px, py] = source_pixels[px, py]
+            colorful = average_chroma >= 35
+
+            if not (near_right_edge and isolated_sliver and colorful):
+                continue
+
+            padding = 5
+            for yy in range(max(0, component_top - padding), min(height, component_bottom + padding)):
+                for xx in range(max(0, component_left - padding), min(width, component_right + padding)):
+                    output_pixels[xx, yy] = white
 
     return output
 
 
-def foreground_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
-    rgb = image.convert("RGB")
-    width, height = rgb.size
-    pixels = rgb.load()
-    background = estimate_background_color(image)
-
-    xs: list[int] = []
-    ys: list[int] = []
-    for y in range(height):
-        for x in range(width):
-            if not is_background(pixels[x, y], background):
-                xs.append(x)
-                ys.append(y)
-
-    if not xs:
-        return None
-    return min(xs), min(ys), max(xs) + 1, max(ys) + 1
-
-
-def tightened_side(image: Image.Image, padding: int = OUTPUT_PADDING) -> int:
-    bbox = foreground_bbox(image)
-    if bbox is None:
-        return image.width
-
+def center_crop_to_content(image: Image.Image, bbox: tuple[int, int, int, int]) -> Image.Image:
     left, top, right, bottom = bbox
-    content_width = right - left
-    content_height = bottom - top
-    return max(content_width, content_height) + padding * 2
-
-
-def center_and_tighten(
-    image: Image.Image,
-    padding: int = OUTPUT_PADDING,
-    target_side: int | None = None,
-) -> Image.Image:
-    bbox = foreground_bbox(image)
-    if bbox is None:
-        return image
-
-    left, top, right, bottom = bbox
-    side = target_side or tightened_side(image, padding)
+    width, height = image.size
+    side = max(right - left, bottom - top) + OUTPUT_PADDING * 2
     center_x = (left + right) / 2
     center_y = (top + bottom) / 2
     crop_left = round(center_x - side / 2)
     crop_top = round(center_y - side / 2)
     crop_right = crop_left + side
     crop_bottom = crop_top + side
+    white = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
+    output = Image.new(image.mode, (side, side), white)
 
-    background = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
-    output = Image.new(image.mode, (side, side), background)
     src_left = max(0, crop_left)
     src_top = max(0, crop_top)
-    src_right = min(image.width, crop_right)
-    src_bottom = min(image.height, crop_bottom)
-
+    src_right = min(width, crop_right)
+    src_bottom = min(height, crop_bottom)
     if src_left < src_right and src_top < src_bottom:
         crop = image.crop((src_left, src_top, src_right, src_bottom))
         output.paste(crop, (src_left - crop_left, src_top - crop_top))
-
-    return output
-
-
-def is_light_gray_artifact(pixel: tuple[int, ...]) -> bool:
-    r, g, b = pixel[:3]
-    brightness = (r + g + b) / 3
-    chroma = max(r, g, b) - min(r, g, b)
-    return 185 <= brightness <= 242 and chroma <= 18
-
-
-def clean_light_horizontal_artifacts(image: Image.Image) -> Image.Image:
-    output = image.copy()
-    rgb = output.convert("RGB")
-    width, height = rgb.size
-    rgb_pixels = rgb.load()
-    output_pixels = output.load()
-    white = (255, 255, 255, 255) if "A" in output.getbands() else (255, 255, 255)
-
-    for y in range(round(height * 0.04), round(height * 0.28)):
-        xs = [x for x in range(width) if is_light_gray_artifact(rgb_pixels[x, y])]
-        if len(xs) < width * 0.22:
-            continue
-
-        for yy in range(max(0, y - 1), min(height, y + 2)):
-            for x in xs:
-                if is_light_gray_artifact(rgb_pixels[x, yy]):
-                    output_pixels[x, yy] = white
 
     return output
 
@@ -401,16 +457,22 @@ def split_image(input_path: Path, output_dir: Path, grid: tuple[int, int] | None
     gifs_dir = output_dir / "gifs"
     records: list[SliceRecord] = []
     pieces: list[tuple[int, int, int, Image.Image]] = []
+    detected_boxes = detect_black_grid_boxes(image, cols, rows)
+    boxes = detected_boxes or list(iter_boxes(image.width, image.height, cols, rows))
 
-    for index, row, col, left, top, right, bottom in iter_boxes(image.width, image.height, cols, rows):
-        square_box = expand_to_square(left, top, right, bottom)
+    for index, row, col, left, top, right, bottom in boxes:
+        if detected_boxes:
+            piece = make_plain_square_slice(image, (left, top, right, bottom))
+            pieces.append((index, row, col, piece))
+            continue
+
+        margin = 0 if detected_boxes else round(max(right - left, bottom - top) * SOURCE_MARGIN_RATIO)
+        expanded_box = expand_box(left, top, right, bottom, margin)
+        square_box = expand_to_square(*expanded_box)
         piece = make_square_slice(image, (left, top, right, bottom), square_box)
         pieces.append((index, row, col, piece))
 
-    target_side = max(tightened_side(piece) for _, _, _, piece in pieces)
-
     for index, row, col, piece in pieces:
-        piece = clean_light_horizontal_artifacts(center_and_tighten(piece, target_side=target_side))
         path = slices_dir / f"{index:02d}.png"
         gif_path = gifs_dir / f"{index:02d}.gif"
         file_size = save_slice(piece, path)

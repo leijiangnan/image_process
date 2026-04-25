@@ -11,7 +11,9 @@ from PIL import Image
 
 NEAR_WHITE_RGB = (244, 244, 244)
 BACKGROUND_DISTANCE = 28
-OUTPUT_PADDING = 10
+OUTPUT_PADDING = 6
+GIF_ROTATION_DEGREES = (-2.0, 2.0)
+GIF_FRAME_DURATION_MS = 180
 
 
 @dataclass(frozen=True)
@@ -20,9 +22,11 @@ class SliceRecord:
     row: int
     col: int
     path: str
+    gif_path: str
     width: int
     height: int
     bytes: int
+    gif_bytes: int
 
 
 def parse_grid(value: str) -> tuple[int, int] | None:
@@ -236,6 +240,12 @@ def keep_components_intersecting_box(
                     or component_height <= height * 0.055
                 )
             )
+            light_line_artifact = (
+                safe_inside_count == 0
+                and average_brightness >= 225
+                and component_height <= max(5, round(height * 0.018))
+                and component_width >= width * 0.18
+            )
             light_outer_artifact = (
                 safe_inside_count == 0
                 and len(component) <= 120
@@ -245,6 +255,7 @@ def keep_components_intersecting_box(
             if (
                 (touches_canvas_edge and safe_inside_count == 0 and inside_ratio < 0.85)
                 or thin_boundary_artifact
+                or light_line_artifact
                 or light_outer_artifact
             ):
                 keep_component = False
@@ -317,9 +328,69 @@ def center_and_tighten(
     return output
 
 
+def is_light_gray_artifact(pixel: tuple[int, ...]) -> bool:
+    r, g, b = pixel[:3]
+    brightness = (r + g + b) / 3
+    chroma = max(r, g, b) - min(r, g, b)
+    return 185 <= brightness <= 242 and chroma <= 18
+
+
+def clean_light_horizontal_artifacts(image: Image.Image) -> Image.Image:
+    output = image.copy()
+    rgb = output.convert("RGB")
+    width, height = rgb.size
+    rgb_pixels = rgb.load()
+    output_pixels = output.load()
+    white = (255, 255, 255, 255) if "A" in output.getbands() else (255, 255, 255)
+
+    for y in range(round(height * 0.04), round(height * 0.28)):
+        xs = [x for x in range(width) if is_light_gray_artifact(rgb_pixels[x, y])]
+        if len(xs) < width * 0.22:
+            continue
+
+        for yy in range(max(0, y - 1), min(height, y + 2)):
+            for x in xs:
+                if is_light_gray_artifact(rgb_pixels[x, yy]):
+                    output_pixels[x, yy] = white
+
+    return output
+
+
 def save_slice(image: Image.Image, path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path, "PNG", optimize=True)
+    return path.stat().st_size
+
+
+def make_gif_frames(image: Image.Image) -> list[Image.Image]:
+    base = image.convert("RGBA")
+    frames: list[Image.Image] = []
+
+    for degrees in GIF_ROTATION_DEGREES:
+        frame = base.rotate(
+            degrees,
+            resample=Image.Resampling.BICUBIC,
+            expand=False,
+            fillcolor=(255, 255, 255, 255),
+        )
+        frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+
+    return frames
+
+
+def save_gif(image: Image.Image, path: Path) -> int:
+    frames = make_gif_frames(image)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(
+        path,
+        "GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=GIF_FRAME_DURATION_MS,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
     return path.stat().st_size
 
 
@@ -327,6 +398,7 @@ def split_image(input_path: Path, output_dir: Path, grid: tuple[int, int] | None
     image = Image.open(input_path)
     cols, rows = grid or detect_grid(image)
     slices_dir = output_dir / "slices"
+    gifs_dir = output_dir / "gifs"
     records: list[SliceRecord] = []
     pieces: list[tuple[int, int, int, Image.Image]] = []
 
@@ -338,18 +410,22 @@ def split_image(input_path: Path, output_dir: Path, grid: tuple[int, int] | None
     target_side = max(tightened_side(piece) for _, _, _, piece in pieces)
 
     for index, row, col, piece in pieces:
-        piece = center_and_tighten(piece, target_side=target_side)
+        piece = clean_light_horizontal_artifacts(center_and_tighten(piece, target_side=target_side))
         path = slices_dir / f"{index:02d}.png"
+        gif_path = gifs_dir / f"{index:02d}.gif"
         file_size = save_slice(piece, path)
+        gif_size = save_gif(piece, gif_path)
         records.append(
             SliceRecord(
                 index=index,
                 row=row,
                 col=col,
                 path=str(path),
+                gif_path=str(gif_path),
                 width=piece.width,
                 height=piece.height,
                 bytes=file_size,
+                gif_bytes=gif_size,
             )
         )
 

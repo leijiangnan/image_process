@@ -1,0 +1,14 @@
+[project]
+name = "image-grid-slicer"
+version = "0.1.0"
+description = "Split 9-grid or 12-grid images into high-quality PNG slices."
+requires-python = ">=3.10"
+dependencies = [
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+image-grid-slicer = "image_grid_slicer.cli:main"
+
+[tool.ruff]
+line-length = 100

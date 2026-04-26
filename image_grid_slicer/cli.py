@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 NEAR_WHITE_RGB = (244, 244, 244)
@@ -14,6 +14,8 @@ BACKGROUND_DISTANCE = 28
 OUTPUT_PADDING = 12
 SOURCE_MARGIN_RATIO = 0.22
 GIF_ROTATION_DEGREES = (-2.0, 2.0)
+GIF_SCALE_FACTORS = (0.94, 1.06)
+TEXT_EFFECT_SCALE_FACTORS = (0.92, 1.08)
 GIF_FRAME_DURATION_MS = 180
 
 
@@ -24,10 +26,14 @@ class SliceRecord:
     col: int
     path: str
     gif_path: str
+    zoom_gif_path: str
+    text_blink_gif_path: str
     width: int
     height: int
     bytes: int
     gif_bytes: int
+    zoom_gif_bytes: int
+    text_blink_gif_bytes: int
 
 
 def parse_grid(value: str) -> tuple[int, int] | None:
@@ -233,7 +239,7 @@ def keep_content_regions(image: Image.Image, keep_box: tuple[int, int, int, int]
     visited: set[tuple[int, int]] = set()
     white = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
     output = Image.new(image.mode, image.size, white)
-    keep_left, keep_top, keep_right, keep_bottom = keep_box
+    keep_left, _, keep_right, _ = keep_box
     copy_boxes: list[tuple[int, int, int, int]] = [
         (
             max(0, keep_left),
@@ -333,7 +339,7 @@ def remove_right_edge_intrusions(image: Image.Image, keep_box: tuple[int, int, i
     output = image.copy()
     output_pixels = output.load()
     white = (255, 255, 255, 255) if "A" in output.getbands() else (255, 255, 255)
-    keep_left, keep_top, keep_right, keep_bottom = keep_box
+    keep_left, _, keep_right, _ = keep_box
     edge_band = max(12, round((keep_right - keep_left) * 0.055))
 
     for y in range(height):
@@ -418,7 +424,11 @@ def save_slice(image: Image.Image, path: Path) -> int:
     return path.stat().st_size
 
 
-def make_gif_frames(image: Image.Image) -> list[Image.Image]:
+def palette_frame(image: Image.Image) -> Image.Image:
+    return image.convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+
+
+def make_rotation_gif_frames(image: Image.Image) -> list[Image.Image]:
     base = image.convert("RGBA")
     frames: list[Image.Image] = []
 
@@ -429,13 +439,172 @@ def make_gif_frames(image: Image.Image) -> list[Image.Image]:
             expand=False,
             fillcolor=(255, 255, 255, 255),
         )
-        frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+        frames.append(palette_frame(frame))
 
     return frames
 
 
-def save_gif(image: Image.Image, path: Path) -> int:
-    frames = make_gif_frames(image)
+def make_zoom_gif_frames(image: Image.Image) -> list[Image.Image]:
+    base = image.convert("RGBA")
+    width, height = base.size
+    frames: list[Image.Image] = []
+
+    for scale in GIF_SCALE_FACTORS:
+        scaled_width = max(1, round(width * scale))
+        scaled_height = max(1, round(height * scale))
+        resized = base.resize((scaled_width, scaled_height), resample=Image.Resampling.LANCZOS)
+        frame = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+        offset_x = (width - scaled_width) // 2
+        offset_y = (height - scaled_height) // 2
+        frame.paste(resized, (offset_x, offset_y), resized)
+        frames.append(palette_frame(frame))
+
+    return frames
+
+
+def find_text_blink_components(image: Image.Image) -> list[list[tuple[int, int]]]:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+    background_color = estimate_background_color(image)
+    mask = [[not is_background(pixels[x, y], background_color) for x in range(width)] for y in range(height)]
+    visited: set[tuple[int, int]] = set()
+    central_left = round(width * 0.22)
+    central_top = round(height * 0.14)
+    central_right = round(width * 0.78)
+    central_bottom = round(height * 0.9)
+    image_area = width * height
+    components: list[list[tuple[int, int]]] = []
+
+    for y in range(height):
+        for x in range(width):
+            if (x, y) in visited or not mask[y][x]:
+                continue
+
+            component: list[tuple[int, int]] = []
+            stack = [(x, y)]
+            visited.add((x, y))
+
+            while stack:
+                cx, cy = stack.pop()
+                component.append((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if (
+                        (nx, ny) in visited
+                        or not (0 <= nx < width and 0 <= ny < height)
+                        or not mask[ny][nx]
+                    ):
+                        continue
+                    visited.add((nx, ny))
+                    stack.append((nx, ny))
+
+            if len(component) < 14:
+                continue
+
+            xs = [point[0] for point in component]
+            ys = [point[1] for point in component]
+            component_left = min(xs)
+            component_right = max(xs) + 1
+            component_top = min(ys)
+            component_bottom = max(ys) + 1
+            component_width = component_right - component_left
+            component_height = component_bottom - component_top
+            component_area = len(component)
+            average_chroma = sum(
+                max(pixels[px, py]) - min(pixels[px, py])
+                for px, py in component
+            ) / component_area
+            overlap_pixels = sum(
+                1
+                for px, py in component
+                if central_left <= px < central_right and central_top <= py < central_bottom
+            )
+            overlap_ratio = overlap_pixels / component_area
+            center_x = (component_left + component_right) / 2
+            center_y = (component_top + component_bottom) / 2
+            near_outer_band = (
+                center_x < width * 0.3
+                or center_x > width * 0.7
+                or center_y < height * 0.36
+                or center_y > height * 0.82
+            )
+            elongated = max(component_width, component_height) >= min(component_width, component_height) * 1.35
+            compact_enough = component_width <= width * 0.58 and component_height <= height * 0.42
+            if component_area > image_area * 0.12 or not compact_enough:
+                continue
+            if overlap_ratio > 0.34 and not near_outer_band:
+                continue
+
+            text_like = average_chroma >= 22 or (average_chroma >= 14 and elongated)
+            decoration_like = near_outer_band and component_area <= image_area * 0.03 and average_chroma >= 10
+            if not (text_like or decoration_like):
+                continue
+
+            components.append(component)
+
+    return components
+
+
+def build_component_sprite(
+    image: Image.Image,
+    component: list[tuple[int, int]],
+) -> tuple[Image.Image, Image.Image, tuple[int, int, int, int], tuple[float, float]]:
+    base = image.convert("RGBA")
+    xs = [point[0] for point in component]
+    ys = [point[1] for point in component]
+    left = min(xs)
+    top = min(ys)
+    right = max(xs) + 1
+    bottom = max(ys) + 1
+    width = right - left
+    height = bottom - top
+    padding = max(3, round(max(width, height) * 0.12))
+    crop_box = (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(base.width, right + padding),
+        min(base.height, bottom + padding),
+    )
+    crop = base.crop(crop_box)
+    mask = Image.new("L", crop.size, 0)
+    mask_pixels = mask.load()
+
+    for x, y in component:
+        mask_pixels[x - crop_box[0], y - crop_box[1]] = 255
+
+    # Expand the mask a bit so outlines and anti-aliased edges stay attached to the text.
+    mask = mask.filter(ImageFilter.MaxFilter(5))
+    sprite = crop.copy()
+    sprite.putalpha(mask)
+    center = ((left + right) / 2, (top + bottom) / 2)
+    return sprite, mask, crop_box, center
+
+
+def make_text_blink_gif_frames(image: Image.Image) -> list[Image.Image]:
+    base = image.convert("RGBA")
+    components = find_text_blink_components(image)
+    if not components:
+        return [palette_frame(base), palette_frame(base)]
+
+    background = (*estimate_background_color(image), 255)
+    sprites = [build_component_sprite(base, component) for component in components]
+    frames: list[Image.Image] = []
+    for scale in TEXT_EFFECT_SCALE_FACTORS:
+        frame = base.copy()
+        for sprite, mask, crop_box, center in sprites:
+            frame.paste(background, crop_box, mask)
+            scaled_width = max(1, round(sprite.width * scale))
+            scaled_height = max(1, round(sprite.height * scale))
+            scaled_sprite = sprite.resize((scaled_width, scaled_height), resample=Image.Resampling.LANCZOS)
+            offset_x = round(center[0] - scaled_width / 2)
+            offset_y = round(center[1] - scaled_height / 2)
+            frame.alpha_composite(scaled_sprite, (offset_x, offset_y))
+        frames.append(palette_frame(frame))
+
+    return frames
+
+
+def save_animation(frames: list[Image.Image], path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     frames[0].save(
         path,
@@ -450,11 +619,25 @@ def save_gif(image: Image.Image, path: Path) -> int:
     return path.stat().st_size
 
 
+def save_gif(image: Image.Image, path: Path) -> int:
+    return save_animation(make_rotation_gif_frames(image), path)
+
+
+def save_zoom_gif(image: Image.Image, path: Path) -> int:
+    return save_animation(make_zoom_gif_frames(image), path)
+
+
+def save_text_blink_gif(image: Image.Image, path: Path) -> int:
+    return save_animation(make_text_blink_gif_frames(image), path)
+
+
 def split_image(input_path: Path, output_dir: Path, grid: tuple[int, int] | None) -> dict[str, object]:
     image = Image.open(input_path)
     cols, rows = grid or detect_grid(image)
     slices_dir = output_dir / "slices"
     gifs_dir = output_dir / "gifs"
+    zoom_gifs_dir = output_dir / "zoom_gifs"
+    text_blink_gifs_dir = output_dir / "text_blink_gifs"
     records: list[SliceRecord] = []
     pieces: list[tuple[int, int, int, Image.Image]] = []
     detected_boxes = detect_black_grid_boxes(image, cols, rows)
@@ -475,8 +658,12 @@ def split_image(input_path: Path, output_dir: Path, grid: tuple[int, int] | None
     for index, row, col, piece in pieces:
         path = slices_dir / f"{index:02d}.png"
         gif_path = gifs_dir / f"{index:02d}.gif"
+        zoom_gif_path = zoom_gifs_dir / f"{index:02d}.gif"
+        text_blink_gif_path = text_blink_gifs_dir / f"{index:02d}.gif"
         file_size = save_slice(piece, path)
         gif_size = save_gif(piece, gif_path)
+        zoom_gif_size = save_zoom_gif(piece, zoom_gif_path)
+        text_blink_gif_size = save_text_blink_gif(piece, text_blink_gif_path)
         records.append(
             SliceRecord(
                 index=index,
@@ -484,10 +671,14 @@ def split_image(input_path: Path, output_dir: Path, grid: tuple[int, int] | None
                 col=col,
                 path=str(path),
                 gif_path=str(gif_path),
+                zoom_gif_path=str(zoom_gif_path),
+                text_blink_gif_path=str(text_blink_gif_path),
                 width=piece.width,
                 height=piece.height,
                 bytes=file_size,
                 gif_bytes=gif_size,
+                zoom_gif_bytes=zoom_gif_size,
+                text_blink_gif_bytes=text_blink_gif_size,
             )
         )
 

@@ -239,7 +239,7 @@ def keep_content_regions(image: Image.Image, keep_box: tuple[int, int, int, int]
     visited: set[tuple[int, int]] = set()
     white = (255, 255, 255, 255) if "A" in image.getbands() else (255, 255, 255)
     output = Image.new(image.mode, image.size, white)
-    keep_left, _, keep_right, _ = keep_box
+    keep_left, keep_top, keep_right, keep_bottom = keep_box
     copy_boxes: list[tuple[int, int, int, int]] = [
         (
             max(0, keep_left),
